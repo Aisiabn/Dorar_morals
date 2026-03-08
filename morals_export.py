@@ -21,7 +21,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 # ── Config ────────────────────────────────────────────────────────────────────
 START_URL    = "https://dorar.net/alakhlaq"
-PAGE_RE      = re.compile(r"/morals/(\d+)")
+PAGE_RE      = re.compile(r"/alakhlaq/(\d+)")
 SKIP_CRUMBS  = 2          # skip: home + encyclopedia name
 DELAY        = 1.0
 TIMEOUT      = 20
@@ -40,6 +40,29 @@ HEADERS = {
 }
 
 LEVEL_NAMES  = {1: "باب", 2: "فصل", 3: "مبحث", 4: "مطلب", 5: "فرع", 6: "مسألة"}
+# اسم أبناء كل مستوى (جمع)
+CHILDREN_NAMES = {1: "فصل", 2: "مبحث", 3: "مطلب", 4: "فرع", 5: "مسألة"}
+
+
+def _count_phrase(n: int, child_type: str) -> str:
+    """يولّد عبارة 'وفيه X ...' بصيغة عربية صحيحة."""
+    if n == 1:
+        return f"وفيه {child_type} واحد"
+    elif n == 2:
+        return f"وفيه {child_type}ان"
+    elif 3 <= n <= 10:
+        # جمع قياسي بإضافة ات/ون — نستخدم صيغة بسيطة
+        plurals = {
+            "فصل": "فصول", "مبحث": "مباحث", "مطلب": "مطالب",
+            "فرع": "فروع", "مسألة": "مسائل",
+        }
+        return f"وفيه {n} {plurals.get(child_type, child_type + 'ات')}"
+    else:
+        plurals = {
+            "فصل": "فصلاً", "مبحث": "مبحثاً", "مطلب": "مطلباً",
+            "فرع": "فرعاً", "مسألة": "مسألةً",
+        }
+        return f"وفيه {n} {plurals.get(child_type, child_type)}"
 INDEX_LEVELS = {1, 2, 3}
 
 PUA_RE  = re.compile(r"[\ue000-\uf8ff]")
@@ -126,16 +149,17 @@ def _next_url(soup: BeautifulSoup, current: str) -> str | None:
         if not PAGE_RE.search(href):
             continue
         txt = a.get_text(strip=True)
-        if "التالي" in txt or txt in ("›", "»", "next"):
+        if txt == "التالي":
             return urljoin(current, href)
-    lnk = soup.find("link", rel="next")
-    if lnk:
-        return urljoin(current, lnk["href"])
     return None
 
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
 def page_title(soup: BeautifulSoup) -> str:
+    # العنوان في h1.h5-responsive وليس og:title (يعيد اسم الموسوعة)
+    h1 = soup.find("h1", class_="h5-responsive")
+    if h1:
+        return h1.get_text(strip=True)
     og = soup.find("meta", property="og:title")
     if og and og.get("content"):
         return og["content"].split(" - ")[0].strip()
@@ -144,26 +168,15 @@ def page_title(soup: BeautifulSoup) -> str:
 
 
 def page_breadcrumb(soup: BeautifulSoup) -> list[str]:
-    bc_el = soup.find(class_=re.compile(r"breadcrumb"))
+    bc_el = soup.find("ol", class_="breadcrumb")
     if not bc_el:
         return []
-    seen, crumbs = set(), []
-    for el in bc_el.find_all(["a", "li", "span"]):
-        t = el.get_text(strip=True)
-        if t and t not in seen:
-            seen.add(t)
-            crumbs.append(t)
-    return crumbs
+    return [li.get_text(strip=True) for li in bc_el.find_all("li") if li.get_text(strip=True)]
 
 
 def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str, str]]]:
     """Return (inner_html, [(fn_id, fn_text)])."""
-    body = (
-        soup.find(class_=re.compile(r"\bcontent\b|\bmain-content\b|\barticle\b"))
-        or soup.find("article")
-        or soup.find("main")
-        or soup.body
-    )
+    body = soup.find("div", class_="col-12 position-relative") or soup.find("div", class_=re.compile(r"col-12"))
     if not body:
         return "", []
 
@@ -389,7 +402,9 @@ def export_markdown(items: list[Item]) -> None:
         hashes  = "#" * item.level
         n       = len(item.children)
         bullets = "\n".join(f"{i}. {c}" for i, c in enumerate(item.children, 1))
-        content = f"{hashes} {item.title}\n\nوفيه {n} أبناء:\n\n{bullets}\n"
+        child_type = CHILDREN_NAMES.get(item.level, "قسم")
+        phrase     = _count_phrase(len(item.children), child_type)
+        content = f"{hashes} {item.title}\n\n{phrase}:\n\n{bullets}\n"
         (matched / "_index.md").write_text(content, encoding="utf-8")
 
     print(f"  → Markdown → {MD_DIR}")
@@ -457,9 +472,11 @@ def _page_xhtml(p: Page) -> str:
 
 
 def _index_xhtml(ip: IndexPage) -> str:
+    child_type = CHILDREN_NAMES.get(ip.level, "قسم")
+    phrase     = _count_phrase(len(ip.children), child_type)
     h   = f"<h{ip.level}>{ip.title}</h{ip.level}>"
     lis = "".join(f"<li>{c}</li>" for c in ip.children)
-    body = f"{h}\n<p>وفيه {len(ip.children)} أبناء:</p>\n<ol>{lis}</ol>"
+    body = f"{h}\n<p>{phrase}:</p>\n<ol>{lis}</ol>"
     return _xhtml(ip.title, body)
 
 
