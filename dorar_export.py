@@ -193,7 +193,11 @@ def page_breadcrumb(soup: BeautifulSoup) -> list[str]:
 
 def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str, str]]]:
     """Return (inner_html, [(fn_id, fn_text)])."""
-    body = soup.find("div", class_="col-12 position-relative") or soup.find("div", class_=re.compile(r"col-12"))
+    body = (
+        soup.find("div", class_=lambda c: c and "col-12" in c and "position-relative" in c)
+        or soup.find("div", class_=lambda c: c and "col-12" in c and "col-lg-11" in c)
+        or soup.find("div", class_=lambda c: c and "amiri_custom_content" in c)
+    )
     if not body:
         return "", []
 
