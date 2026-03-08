@@ -5,7 +5,7 @@ inspect_dorar.py — يفحص بنية HTML لصفحة من dorar.net
 import requests
 from bs4 import BeautifulSoup
 
-URL = "https://dorar.net/morals/1"
+URL = "https://dorar.net/akhlaq/1"
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 "
