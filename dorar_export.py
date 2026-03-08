@@ -1,727 +1,548 @@
-#!/usr/bin/env python3
 """
-morals_export.py — Export dorar.net/alakhlaq to EPUB + Markdown
-Usage:
-    python dorar_export.py
-    TEST_PAGES=10 python dorar_export.py
+موسوعة القواعد الفقهية — dorar.net/qfiqhia
+مخرج: ملف EPUB — الهوامش في نهاية كل صفحة مرتبطة بمواضعها
 """
-
-import os
-import re
-import time
-import uuid
-import zipfile
-from collections import defaultdict
-from dataclasses import dataclass, field
-from pathlib import Path
-from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup, NavigableString, Tag
+import hashlib
+from bs4 import BeautifulSoup
+import re
+import time
+import os
+import traceback
+from ebooklib import epub
 
-# ── Config ────────────────────────────────────────────────────────────────────
-START_URL    = "https://dorar.net/alakhlaq"
-PAGE_RE      = re.compile(r"/alakhlaq/(\d+)")
-SKIP_CRUMBS  = 2          # skip: home + encyclopedia name
-DELAY        = 1.0
-TIMEOUT      = 20
-TEST_PAGES   = int(os.getenv("TEST_PAGES") or 0)
-OUT_DIR      = Path("output")
-EPUB_PATH    = OUT_DIR / "morals.epub"
-MD_DIR       = OUT_DIR / "md"
-BOOK_TITLE   = "موسوعة الأخلاق"
+BASE     = "https://dorar.net"
+INDEX    = "https://dorar.net/qfiqhia"
+DELAY    = 1.0
+OUT_DIR  = "dorar_qfiqhia"
+EPUB_OUT = os.path.join(OUT_DIR, "موسوعة_القواعد_الفقهية.epub")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 "
-        "Chrome/109.0.0.0"
-    ),
-    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-}
-
-LEVEL_NAMES  = {1: "باب", 2: "فصل", 3: "مبحث", 4: "مطلب", 5: "فرع", 6: "مسألة"}
-# اسم أبناء كل مستوى (جمع)
-CHILDREN_NAMES = {1: "فصل", 2: "مبحث", 3: "مطلب", 4: "فرع", 5: "مسألة"}
-
-
-def _count_phrase(n: int, child_type: str) -> str:
-    """يولّد عبارة 'وفيه X ...' بصيغة عربية صحيحة."""
-    if n == 1:
-        return f"وفيه {child_type} واحد"
-    elif n == 2:
-        return f"وفيه {child_type}ان"
-    elif 3 <= n <= 10:
-        # جمع قياسي بإضافة ات/ون — نستخدم صيغة بسيطة
-        plurals = {
-            "فصل": "فصول", "مبحث": "مباحث", "مطلب": "مطالب",
-            "فرع": "فروع", "مسألة": "مسائل",
-        }
-        return f"وفيه {n} {plurals.get(child_type, child_type + 'ات')}"
-    else:
-        plurals = {
-            "فصل": "فصلاً", "مبحث": "مبحثاً", "مطلب": "مطلباً",
-            "فرع": "فرعاً", "مسألة": "مسألةً",
-        }
-        return f"وفيه {n} {plurals.get(child_type, child_type)}"
-INDEX_LEVELS = {1, 2, 3}
-
-PUA_RE  = re.compile(r"[\ue000-\uf8ff]")
-SAFE_RE = re.compile(r'[\\/:*?"<>|]')
-
-NAV_TEXT_RE = re.compile(
-    r"السابق|التالي|انظر\s+أيض|الرابط\s+المختصر|مشاركة|share",
-    re.I,
+TEST_PAGES = None if os.environ.get("TEST_PAGES") == "None" else (
+    int(os.environ["TEST_PAGES"]) if os.environ.get("TEST_PAGES") else None
 )
 
-REMOVE_SELECTORS = [
-    "nav", "header", "footer", "script", "style", "form",
-    ".card-title", ".dorar-bg-lightGreen", ".collapse",
-    "h3#more-titles",
-]
-
-# ── HTTP Session ──────────────────────────────────────────────────────────────
-_session = requests.Session()
-_session.headers.update(HEADERS)
-
-
-def fetch(url: str) -> BeautifulSoup | None:
-    try:
-        r = _session.get(url, timeout=TIMEOUT)
-        r.raise_for_status()
-        r.encoding = "utf-8"
-        return BeautifulSoup(r.text, "html.parser")
-    except Exception as exc:
-        print(f"  [ERROR] {url}: {exc}")
-        return None
-
-
-# ── Data Classes ──────────────────────────────────────────────────────────────
-@dataclass
-class Page:
-    pid:          str
-    url:          str
-    title:        str
-    level:        int
-    breadcrumb:   list[str]
-    body_html:    str
-    footnotes:    list[tuple[str, str]]  # [(fn_id, text)]
-
-    def epub_filename(self) -> str:
-        return f"p{self.pid}.xhtml"
-
-
-@dataclass
-class IndexPage:
-    pid:      str
-    title:    str
-    level:    int
-    children: list[str]  # direct child titles
-
-    def epub_filename(self) -> str:
-        return f"p{self.pid}.xhtml"
-
-
-Item = Page | IndexPage
-
-# ── Discovery ────────────────────────────────────────────────────────────────
-def discover_urls() -> list[str]:
-    # الخطوة 1: اجمع كل روابط المحتوى من صفحة الفهرس
-    print(f"  جلب فهرس الروابط من {START_URL}…")
-    index_soup = fetch(START_URL)
-    all_ids: set[int] = set()
-    if index_soup:
-        for a in index_soup.find_all("a", href=True):
-            m = PAGE_RE.search(a["href"])
-            if m:
-                all_ids.add(int(m.group(1)))
-    if not all_ids:
-        print("  [تحذير] لم يُعثر على روابط في صفحة الفهرس")
-        return []
-
-    # الخطوة 2: ابدأ من أصغر رقم واتبع زر التالي
-    base = "https://dorar.net"
-    url  = f"{base}/alakhlaq/{min(all_ids)}"
-    urls, seen = [], set()
-
-    while url:
-        if url in seen:
-            break
-        seen.add(url)
-        urls.append(url)
-        print(f"  [{len(urls):>4}] {url}")
-        if TEST_PAGES and len(urls) >= TEST_PAGES:
-            break
-        time.sleep(DELAY)
-        soup = fetch(url)
-        if not soup:
-            break
-        url = _next_url(soup, url)
-
-    return urls
-
-
-def _next_url(soup: BeautifulSoup, current: str) -> str | None:
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if not PAGE_RE.search(href):
-            continue
-        txt = a.get_text(strip=True)
-        if txt == "التالي":
-            return urljoin(current, href)
-    return None
-
-
-# ── Parsing ──────────────────────────────────────────────────────────────────
-def page_title(soup: BeautifulSoup) -> str:
-    # العنوان في h1.h5-responsive وليس og:title (يعيد اسم الموسوعة)
-    h1 = soup.find("h1", class_="h5-responsive")
-    if h1:
-        return h1.get_text(strip=True)
-    og = soup.find("meta", property="og:title")
-    if og and og.get("content"):
-        return og["content"].split(" - ")[0].strip()
-    t = soup.find("title")
-    return t.get_text().split(" - ")[0].strip() if t else "بدون عنوان"
-
-
-def page_breadcrumb(soup: BeautifulSoup) -> list[str]:
-    bc_el = soup.find("ol", class_="breadcrumb")
-    if not bc_el:
-        return []
-    return [li.get_text(strip=True) for li in bc_el.find_all("li") if li.get_text(strip=True)]
-
-
-def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str, str]]]:
-    """Return (inner_html, [(fn_id, fn_text)])."""
-    body = (
-        soup.find("div", class_=lambda c: c and "col-12" in c and "position-relative" in c)
-        or soup.find("div", class_=lambda c: c and "col-12" in c and "col-lg-11" in c)
-        or soup.find("div", class_=lambda c: c and "amiri_custom_content" in c)
-    )
-    if not body:
-        return "", []
-
-    body = BeautifulSoup(str(body), "html.parser")   # work on a copy
-
-    for sel in REMOVE_SELECTORS:
-        for el in body.select(sel):
-            # إن كان h3#more-titles احذف الـ ul بعده أيضاً
-            if getattr(el, "name", "") == "h3" and el.get("id") == "more-titles":
-                nxt = el.find_next_sibling("ul")
-                if nxt:
-                    nxt.decompose()
-            el.decompose()
-
-    for a in body.find_all("a"):
-        if NAV_TEXT_RE.search(a.get_text()):
-            a.decompose()
-
-    # احذف قسم "انظر أيضا" إن بقي (fallback)
-    for h3 in body.find_all("h3", class_="default-text-color"):
-        if "انظر" in h3.get_text():
-            # احذف كل العناصر اللي بعده
-            for sib in list(h3.find_next_siblings()):
-                sib.decompose()
-            h3.decompose()
-            break
-
-    footnotes: list[tuple[str, str]] = []
-    fn_n = 0
-
-    # Process tips in reverse so counter matches document order after reversal
-    tips = list(body.find_all(class_="tip"))
-    for span in tips:
-        fn_text = (
-            span.get("data-original-title")
-            or span.get("data-content")
-            or span.get("data-tippy-content")
-            or span.get_text(strip=True)
-        )
-        fn_n += 1
-        fn_id = f"fn-{pid}-{fn_n}"
-        footnotes.append((fn_id, fn_text))
-        anchor = BeautifulSoup(
-            f'<sup id="ref-{fn_id}"><a href="#{fn_id}">[{fn_n}]</a></sup>', "html.parser"
-        )
-        span.replace_with(anchor)
-
-    for span in body.find_all("span"):
-        cls = set(span.get("class", []))
-        txt = span.get_text()
-
-        if "aaya" in cls:
-            span.replace_with(f"﴿{txt}﴾")
-        elif "hadith" in cls:
-            span.replace_with(f"«{txt}»")
-        elif "sora" in cls:
-            span.replace_with(PUA_RE.sub("", txt))
-        elif "title-2" in cls:
-            h = BeautifulSoup(f"<h4>{txt}</h4>", "html.parser")
-            span.replace_with(h)
-        elif "title-1" in cls:
-            h = BeautifulSoup(f"<h5>{txt}</h5>", "html.parser")
-            span.replace_with(h)
-
-    return body.decode_contents(), footnotes
-
-
-# ── Scrape All ────────────────────────────────────────────────────────────────
-def scrape_all() -> list[Page]:
-    urls = discover_urls()
-    print(f"\n{len(urls)} pages found. Parsing content…\n")
-    pages: list[Page] = []
-
-    for i, url in enumerate(urls, 1):
-        pid = f"{i:05d}"
-        print(f"  parse {pid}: {url}")
-        soup = fetch(url)
-        if not soup:
-            continue
-        time.sleep(DELAY)
-
-        title = page_title(soup)
-        bc    = page_breadcrumb(soup)
-
-        # Guarantee last crumb == title
-        if not bc or bc[-1] != title:
-            bc.append(title)
-
-        depth = max(0, len(bc) - SKIP_CRUMBS - 1)
-        level = min(depth + 1, 6)
-
-        body_html, footnotes = extract_content(soup, pid)
-        pages.append(Page(pid, url, title, level, bc, body_html, footnotes))
-
-    return pages
-
-
-# ── Build Flat Document Order (with index pages) ───────────────────────────────
-def build_document(pages: list[Page]) -> list[Item]:
-    """
-    Walk pages in order; before the first page of each new section at
-    levels 1–3, insert an IndexPage listing its direct children.
-    """
-    # Pre-pass: collect direct children per section key
-    section_children: dict[tuple, list[str]] = defaultdict(list)
-    for p in pages:
-        ancestors = p.breadcrumb[SKIP_CRUMBS:]      # strip home + book
-        for depth in range(min(len(ancestors) - 1, 3)):
-            parent_key   = tuple(ancestors[: depth + 1])
-            child_name   = ancestors[depth + 1] if depth + 1 < len(ancestors) else p.title
-            kids = section_children[parent_key]
-            if child_name not in kids:
-                kids.append(child_name)
-
-    seen_idx: set[tuple] = set()
-    idx_n    = 0
-    result: list[Item] = []
-
-    for p in pages:
-        ancestors = p.breadcrumb[SKIP_CRUMBS:]
-        for depth in range(min(len(ancestors) - 1, 3)):
-            key   = tuple(ancestors[: depth + 1])
-            level = depth + 1
-            if key not in seen_idx:
-                seen_idx.add(key)
-                idx_n += 1
-                result.append(
-                    IndexPage(
-                        pid      = f"idx{idx_n:04d}",
-                        title    = ancestors[depth],
-                        level    = level,
-                        children = section_children[key],
-                    )
-                )
-        result.append(p)
-
-    return result
-
-
-# ── Markdown Export ───────────────────────────────────────────────────────────
-def safe_name(s: str, maxlen: int = 80) -> str:
-    s = SAFE_RE.sub("", s).replace(" ", "_")
-    return s[:maxlen]
-
-
-def _ancestors_dirs(bc: list[str]) -> list[str]:
-    """Folder segments from breadcrumb (skip home+book, skip page itself)."""
-    return [safe_name(s) for s in bc[SKIP_CRUMBS:-1]]
-
-
-def html_to_md(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-
-    def walk(node) -> str:
-        if isinstance(node, NavigableString):
-            return str(node)
-        if not isinstance(node, Tag):
-            return ""
-        name = node.name
-
-        if name in ("script", "style"):
-            return ""
-        if name in ("h4",):
-            return f"\n\n#### {node.get_text(strip=True)}\n\n"
-        if name in ("h5",):
-            return f"\n\n##### {node.get_text(strip=True)}\n\n"
-        if name == "p":
-            inner = "".join(walk(c) for c in node.children)
-            return f"\n\n{inner.strip()}\n\n"
-        if name in ("ul", "ol"):
-            items = [f"- {li.get_text(strip=True)}" for li in node.find_all("li")]
-            return "\n" + "\n".join(items) + "\n\n"
-        if name == "br":
-            return "  \n"
-        if name == "sup":
-            return node.get_text()
-        return "".join(walk(c) for c in node.children)
-
-    md = walk(soup)
-    return re.sub(r"\n{3,}", "\n\n", md).strip()
-
-
-def export_markdown(items: list[Item]) -> None:
-    MD_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Build a lookup: section_key → folder path (resolved on first real Page)
-    section_dirs: dict[tuple, Path] = {}
-
-    def _section_dir(bc: list[str], depth: int) -> Path:
-        key = tuple(bc[SKIP_CRUMBS: SKIP_CRUMBS + depth + 1])
-        if key not in section_dirs:
-            parts = [safe_name(s) for s in bc[SKIP_CRUMBS: SKIP_CRUMBS + depth + 1]]
-            section_dirs[key] = MD_DIR.joinpath(*parts)
-        return section_dirs[key]
-
-    for item in items:
-        if isinstance(item, Page):
-            parts = _ancestors_dirs(item.breadcrumb)
-            folder = MD_DIR.joinpath(*parts) if parts else MD_DIR
-            folder.mkdir(parents=True, exist_ok=True)
-            fname  = f"{item.pid}_{safe_name(item.title)}.md"
-            hashes = "#" * item.level
-            md     = html_to_md(item.body_html)
-            fn_block = ""
-            if item.footnotes:
-                lines = [f"[^{fid.split('-')[-1]}]: {txt}"
-                         for fid, txt in item.footnotes]
-                fn_block = "\n\n---\n\n" + "\n".join(lines)
-            content = (
-                f"{hashes} {item.title}\n\n"
-                f"> المصدر: {item.url}\n\n"
-                f"{md}{fn_block}\n"
-            )
-            (folder / fname).write_text(content, encoding="utf-8")
-
-        elif isinstance(item, IndexPage):
-            # Determine folder from the first Page that belongs to this section
-            # We store by (level, title) — resolved later if needed
-            # Use section_dirs cache keyed on what we know
-            # Best we can do without page's bc: write to a flat fallback
-            pass   # filled in second pass below
-
-    # Second pass for IndexPages: we now have section_dirs populated
-    for item in items:
-        if not isinstance(item, IndexPage):
-            continue
-        # Find matching section dir
-        matched = None
-        for key, dpath in section_dirs.items():
-            if len(key) == item.level and key[-1] == item.title:
-                matched = dpath
-                break
-        if matched is None:
-            matched = MD_DIR / safe_name(item.title)
-
-        matched.mkdir(parents=True, exist_ok=True)
-        hashes  = "#" * item.level
-        n       = len(item.children)
-        bullets = "\n".join(f"{i}. {c}" for i, c in enumerate(item.children, 1))
-        child_type = CHILDREN_NAMES.get(item.level, "قسم")
-        phrase     = _count_phrase(len(item.children), child_type)
-        content = f"{hashes} {item.title}\n\n{phrase}:\n\n{bullets}\n"
-        (matched / "_index.md").write_text(content, encoding="utf-8")
-
-    print(f"  → Markdown → {MD_DIR}")
-
-
-# ── EPUB Export ───────────────────────────────────────────────────────────────
-EPUB_CSS = """\
-@charset "UTF-8";
+_TIP_RE = re.compile(r'\x01(\d+)\x01')
+HTML_HEADING = {1:"h1", 2:"h2", 3:"h3", 4:"h4", 5:"h5", 6:"h6"}
+
+# المستويات التي تحصل على صفحة فهرس
+INDEX_LEVELS = {1, 2, 3}
+
+# أسماء أبناء كل مستوى للعرض
+CHILD_LABELS = {
+    2: ("فصل",  "فصلان",  "فصول"),
+    3: ("مبحث", "مبحثان", "مباحث"),
+    4: ("مطلب", "مطلبان", "مطالب"),
+}
+NUM_WORDS = ['', 'واحد', 'اثنان', 'ثلاثة', 'أربعة', 'خمسة',
+             'ستة', 'سبعة', 'ثمانية', 'تسعة', 'عشرة']
+
+def count_label(n, child_level):
+    sing, dual, plur = CHILD_LABELS.get(child_level, ("قسم", "قسمان", "أقسام"))
+    if n == 1: return f"{sing} واحد"
+    if n == 2: return dual
+    if 3 <= n <= 10: return f"{NUM_WORDS[n]} {plur}"
+    return f"{n} {plur}"
+
+def short_hash(s):
+    return hashlib.md5(s.encode("utf-8")).hexdigest()[:8]
+
+BOOK_CSS = """\
 body {
     direction: rtl;
-    font-family: Amiri, "Traditional Arabic", "Scheherazade New", Arial, sans-serif;
-    font-size: 1em;
-    line-height: 1.9;
-    margin: 1em 2em;
-    color: #333;
+    font-family: "Amiri", "Traditional Arabic", "Scheherazade New", "Arial", sans-serif;
+    font-size: 1.1em; line-height: 1.9;
+    margin: 1.5em 2em; color: #1a1a1a; background: #fafaf8;
 }
-h1, h2, h3, h4, h5, h6 {
-    font-size: 1em;
-    color: #2c3e50;
-    margin: 1em 0 0.4em;
-    font-weight: bold;
-}
-p, li, td, th, span, div {
-    font-size: 1em;
-}
-* {
-    font-size: inherit;
-}
-p { margin: 0.4em 0 0.9em; text-align: justify; }
-.ayah  { color: #1a5276; }
-.hadith { color: #1e8449; }
-ol, ul  { margin: 0.4em 0; padding-right: 1.5em; }
-sup a   { color: #888; font-size: 0.8em; text-decoration: none; }
+h1,h2,h3,h4,h5,h6 { font-size:1.1em; font-weight:bold; margin-top:1.4em; margin-bottom:0.4em; color:#2c3e50; }
+p  { margin:0.6em 0; text-align:justify; }
+ol,ul { margin:0.5em 0 0.5em 1.5em; }
+li { margin:0.3em 0; }
+.aaya   { font-size:1.15em; color:#1a5276; font-weight:bold; }
+.hadith { color:#1e8449; font-style:italic; }
 .footnotes {
-    border-top: 1px solid #ccc;
-    margin-top: 2em;
-    padding-top: 0.8em;
-    font-size: 0.9em;
+    margin-top: 2.5em; padding-top: 0.8em;
+    border-top: 2px solid #bdc3c7; font-size: 0.88em; color: #555;
 }
-.footnotes ol { padding-right: 1em; }
+.footnotes p { margin:0.35em 0; line-height: 1.6; }
+sup { font-size: 0.75em; line-height: 0; }
+sup a { color:#2980b9; text-decoration:none; }
+.fn-backref { color:#999; font-size:0.85em; text-decoration:none; margin-right:0.3em; }
+.source-link { display:block; margin-top:0.5em; font-size:0.8em; color:#999; }
+hr { border:none; border-top:1px solid #ddd; margin:1.5em 0; }
 """
 
-_XHTML_TMPL = """\
-<?xml version="1.0" encoding="utf-8"?>
+def make_session():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    })
+    return s
+
+def get_page(session, url, referer=INDEX, retries=4):
+    session.headers["Referer"] = referer
+    for attempt in range(1, retries + 1):
+        try:
+            r = session.get(url, timeout=20)
+            print(f"  [{r.status_code}] {url}")
+            if r.status_code == 200:
+                return r.text
+            if r.status_code in (429, 503, 520, 521, 522, 524):
+                wait = attempt * 10
+                print(f"  [retry {attempt}/{retries}] انتظار {wait}s...")
+                time.sleep(wait)
+                continue
+            return ""
+        except Exception as e:
+            print(f"  [ERR attempt {attempt}] {url} — {e}")
+            time.sleep(attempt * 5)
+    print(f"  [FAILED] تجاوز عدد المحاولات: {url}")
+    return ""
+
+SECTION_RE = re.compile(r"^/qfiqhia/(\d+)(?:/|$)")
+
+def get_id_from_url(url):
+    m = SECTION_RE.match(url.replace(BASE, ""))
+    return int(m.group(1)) if m else None
+
+def get_first_link(html):
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=SECTION_RE):
+        return BASE + a["href"]
+    return f"{BASE}/qfiqhia/1"
+
+def get_page_title(html):
+    soup = BeautifulSoup(html, "html.parser")
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content"):
+        return og["content"].split(" - ", 1)[0].strip()
+    t = soup.find("title")
+    if t:
+        return t.get_text().split(" - ")[0].strip()
+    return ""
+
+def get_next_link(html):
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=SECTION_RE):
+        if "التالي" in a.get_text():
+            return BASE + a["href"]
+    return None
+
+def get_breadcrumb(html):
+    soup = BeautifulSoup(html, "html.parser")
+    for sel in ["ol.breadcrumb li", "ul.breadcrumb li",
+                "nav[aria-label='breadcrumb'] li", ".breadcrumb-item"]:
+        items = soup.select(sel)
+        if items:
+            texts = [i.get_text(strip=True) for i in items if i.get_text(strip=True)]
+            return texts[2:]   # تجاوز الرئيسة + اسم الموسوعة
+    return []
+
+def convert_inner_soup(soup_tag):
+    for inner in soup_tag.find_all("span", class_="aaya"):
+        inner.replace_with(f"﴿{inner.get_text(strip=True)}﴾")
+    for inner in soup_tag.find_all("span", class_="hadith"):
+        inner.replace_with(f"«{inner.get_text(strip=True)}»")
+    for inner in soup_tag.find_all("span", class_="sora"):
+        t = inner.get_text(strip=True)
+        if t: inner.replace_with(f" {t} ")
+
+def get_tip_text(tip) -> str:
+    for attr in ("data-original-title", "data-content", "data-tippy-content"):
+        val = tip.get(attr, "").strip()
+        if val:
+            s = BeautifulSoup(val, "html.parser")
+            convert_inner_soup(s)
+            return re.sub(r'\s+', ' ', s.get_text()).strip()
+    text = re.sub(r'\s+', ' ', tip.get_text()).strip()
+    text = re.sub(r'^\s*\[?\d+\]?\s*', '', text).strip()
+    return text
+
+def _clean_sora(span) -> str:
+    text = span.get_text(strip=True)
+    text = re.sub(r'[\ue000-\uf8ff]', '', text).strip()
+    return text
+
+def extract_content(html: str, page_id: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all(["nav", "header", "footer", "script", "style", "form"]):
+        tag.decompose()
+
+    cntnt = soup.find("div", id="cntnt") or \
+            soup.find("div", class_="card-body") or \
+            soup.find("body") or soup
+
+    for sel in ["div.card-title", "div.dorar-bg-lightGreen", "div.collapse",
+                "div.smooth-scroll", "div.white.z-depth-1", "span.scroll-pos",
+                "div.d-flex.justify-content-between", "#enc-tip"]:
+        for tag in cntnt.select(sel): tag.decompose()
+
+    for h3 in cntnt.find_all("h3", id="more-titles"):
+        nxt = h3.find_next_sibling("ul")
+        if nxt: nxt.decompose()
+        h3.decompose()
+
+    content_div = cntnt.find("div", class_=lambda c: c and "w-100" in c and "mt-4" in c) \
+                  or cntnt
+
+    for span in content_div.find_all("span", class_="sora"):
+        span.replace_with(f" {_clean_sora(span)} ")
+
+    tips_map, tip_counter = {}, [1]
+    for tip in reversed(list(content_div.find_all("span", class_="tip"))):
+        tip_text = get_tip_text(tip)
+        if tip_text:
+            tips_map[tip_counter[0]] = tip_text
+            tip.replace_with(f"\x01{tip_counter[0]}\x01")
+            tip_counter[0] += 1
+        else:
+            tip.decompose()
+
+    for span in content_div.find_all("span", class_="aaya"):
+        span.replace_with(f'<span class="aaya">﴿{span.get_text(strip=True)}﴾</span>')
+    for span in content_div.find_all("span", class_="hadith"):
+        span.replace_with(f'<span class="hadith">«{span.get_text(strip=True)}»</span>')
+    for span in content_div.find_all("span", class_="title-2"):
+        span.replace_with(f'<h4>{span.get_text(strip=True)}</h4>')
+    for span in content_div.find_all("span", class_="title-1"):
+        span.replace_with(f'<h5>{span.get_text(strip=True)}</h5>')
+    for a in content_div.find_all("a"):
+        if re.search(r"السابق|التالي|انظر أيضا|الرابط المختصر|مشاركة", a.get_text(strip=True)):
+            a.decompose()
+
+    all_footnotes     = []
+    global_fn_counter = [1]
+    raw_text          = content_div.get_text(separator="\n")
+
+    def replace_marker(m, _t=tips_map, _f=all_footnotes,
+                       _c=global_fn_counter, _pid=page_id):
+        tid    = int(m.group(1))
+        body   = _t.get(tid, '')
+        n      = _c[0]
+        fn_id  = f"fn-{_pid}-{n}"
+        ref_id = f"ref-{_pid}-{n}"
+        _f.append((fn_id, ref_id, n, body))
+        _c[0] += 1
+        return f'<sup id="{ref_id}"><a href="#{fn_id}">[{n}]</a></sup>'
+
+    processed = _TIP_RE.sub(replace_marker, raw_text)
+    processed = re.sub(r'[ \t]+', ' ', processed)
+    processed = re.sub(r'\n{3,}', '\n\n', processed)
+
+    html_parts = []
+    for para in re.split(r'\n{2,}', processed.strip()):
+        para = para.strip()
+        if para:
+            html_parts.append(para if para.startswith('<h') else f'<p>{para}</p>')
+
+    footnotes_html = ""
+    if all_footnotes:
+        fn_lines = ['<div class="footnotes">', '<hr/>',
+                    '<p><strong>الهوامش</strong></p>']
+        for fn_id, ref_id, n, body in all_footnotes:
+            fn_lines.append(
+                f'<p id="{fn_id}">'
+                f'<a class="fn-backref" href="#{ref_id}">↑</a>'
+                f'<sup>[{n}]</sup> {body}</p>'
+            )
+        fn_lines.append('</div>')
+        footnotes_html = "\n".join(fn_lines)
+
+    return {
+        "text_html"     : "\n".join(html_parts),
+        "footnotes_html": footnotes_html,
+        "fn_count"      : len(all_footnotes),
+    }
+
+
+def build_real_page_html(title, level, url, parsed):
+    htag = HTML_HEADING.get(level, "h3")
+    return f"""<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="ar" dir="rtl">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="ar" lang="ar" dir="rtl">
 <head>
   <meta charset="utf-8"/>
   <title>{title}</title>
   <link rel="stylesheet" type="text/css" href="../styles/book.css"/>
 </head>
 <body>
-{body}
+  <{htag}>{title}</{htag}>
+  <a class="source-link" href="{url}">{url}</a>
+  <hr/>
+  {parsed['text_html']}
+  {parsed['footnotes_html']}
 </body>
 </html>"""
 
 
-def _xhtml(title: str, body: str) -> str:
-    return _XHTML_TMPL.format(title=title, body=body)
+# ─── صفحات الفهرس (باب / فصل / مبحث) ────────────────────────────────
+def build_section_tree(real_pages):
+    """
+    يبني شجرة الأقسام للمستويات 1-3.
+    يعيد dict مرتب: (level, title) →
+        { title, level, children: [child_title, ...] }
+    الأبناء بالترتيب الذي ظهروا فيه أثناء الجلب.
+    """
+    sections = {}
+    order    = []   # لحفظ الترتيب
+
+    for page in real_pages:
+        bc = page["breadcrumb"]
+        for depth in range(min(3, len(bc) - 1)):
+            lvl   = depth + 1
+            title = bc[depth]
+            key   = (lvl, title)
+            if key not in sections:
+                sections[key] = {"title": title, "level": lvl, "children": []}
+                order.append(key)
+            # الابن المباشر
+            if depth + 1 < len(bc):
+                child = bc[depth + 1]
+                if child not in sections[key]["children"]:
+                    sections[key]["children"].append(child)
+
+    return {k: sections[k] for k in order}
 
 
-def _page_xhtml(p: Page) -> str:
-    h = f"<h{p.level}>{p.title}</h{p.level}>"
-    fn_sec = ""
-    if p.footnotes:
-        items = "".join(
-            f'<li id="{fid}"><sup>[{fid.split("-")[-1]}]</sup> {txt} <a href="#ref-{fid}">↑</a></li>'
-            for fid, txt in p.footnotes
-        )
-        fn_sec = f'<div class="footnotes"><ol>{items}</ol></div>'
-    return _xhtml(p.title, f"{h}\n{p.body_html}\n{fn_sec}")
+def make_index_page_html(sec):
+    """ينشئ HTML لصفحة فهرس قسم."""
+    title       = sec["title"]
+    level       = sec["level"]
+    children    = sec["children"]
+    child_level = level + 1
+    htag        = HTML_HEADING.get(level, "h2")
 
+    label    = count_label(len(children), child_level)
+    items_html = "\n    ".join(f"<li>{c}</li>" for c in children)
 
-def _index_xhtml(ip: IndexPage) -> str:
-    child_type = CHILDREN_NAMES.get(ip.level, "قسم")
-    phrase     = _count_phrase(len(ip.children), child_type)
-    h   = f"<h{ip.level}>{ip.title}</h{ip.level}>"
-    lis = "".join(f"<li>{c}</li>" for c in ip.children)
-    body = f"{h}\n<p>{phrase}:</p>\n<ol>{lis}</ol>"
-    return _xhtml(ip.title, body)
-
-
-def _cover_xhtml(total_pages: int) -> str:
-    body = (
-        f'<div style="text-align:center;padding:4em 2em">'
-        f"<h1>{BOOK_TITLE}</h1>"
-        f"<p>عدد الصفحات: {total_pages}</p>"
-        f"</div>"
-    )
-    return _xhtml(BOOK_TITLE, body)
-
-
-# ── NCX / NAV builders ───────────────────────────────────────────────────────
-def _build_toc_tree(entries: list[tuple]) -> list[dict]:
-    """entries: [(level, title, pid), ...] → nested dicts."""
-    root: list[dict] = []
-    stack: list[tuple[int, list]] = []   # (level, children_list)
-
-    for level, title, pid in entries:
-        node = {"level": level, "title": title, "pid": pid, "children": []}
-        while stack and stack[-1][0] >= level:
-            stack.pop()
-        target = stack[-1][1] if stack else root
-        target.append(node)
-        stack.append((level, node["children"]))
-
-    return root
-
-
-def _render_ncx(nodes: list[dict], po: list, indent: int = 4) -> list[str]:
-    lines = []
-    sp    = " " * indent
-    for n in nodes:
-        po[0] += 1
-        lines += [
-            f'{sp}<navPoint id="np-{n["pid"]}" playOrder="{po[0]}">',
-            f'{sp}  <navLabel><text>{n["title"]}</text></navLabel>',
-            f'{sp}  <content src="pages/{n["pid"]}.xhtml"/>',
-        ]
-        if n["children"]:
-            lines += _render_ncx(n["children"], po, indent + 2)
-        lines.append(f"{sp}</navPoint>")
-    return lines
-
-
-def _render_nav_ol(nodes: list[dict], indent: int = 2) -> list[str]:
-    if not nodes:
-        return []
-    sp    = " " * indent
-    lines = [f"{sp}<ol>"]
-    for n in nodes:
-        href = f'pages/{n["pid"]}.xhtml'
-        if n["children"]:
-            lines.append(f'{sp}  <li><a href="{href}">{n["title"]}</a>')
-            lines += _render_nav_ol(n["children"], indent + 4)
-            lines.append(f"{sp}  </li>")
-        else:
-            lines.append(f'{sp}  <li><a href="{href}">{n["title"]}</a></li>')
-    lines.append(f"{sp}</ol>")
-    return lines
-
-
-def _nav_xhtml(entries: list[tuple]) -> str:
-    tree  = _build_toc_tree(entries)
-    inner = "\n".join(_render_nav_ol(tree))
-    return f"""\
-<?xml version="1.0" encoding="utf-8"?>
-<html xmlns="http://www.w3.org/1999/xhtml"
-      xmlns:epub="http://www.idpf.org/2007/ops"
-      xml:lang="ar" dir="rtl">
-<head><meta charset="utf-8"/><title>المحتويات</title></head>
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="ar" lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8"/>
+  <title>{title}</title>
+  <link rel="stylesheet" type="text/css" href="../styles/book.css"/>
+</head>
 <body>
-<nav epub:type="toc" id="toc">
-  <h1>المحتويات</h1>
-{inner}
-</nav>
+  <{htag}>{title}</{htag}>
+  <hr/>
+  <p>وفيه {label}:</p>
+  <ol>
+    {items_html}
+  </ol>
 </body>
 </html>"""
 
 
-# ── EPUB assembly ─────────────────────────────────────────────────────────────
-def export_epub(items: list[Item]) -> None:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    uid   = str(uuid.uuid4())
-    pages = [i for i in items if isinstance(i, Page)]
+def build_final_pages(real_pages, sections):
+    """
+    يدمج صفحات الفهرس مع الصفحات الفعلية بالترتيب الصحيح.
+    صفحة الفهرس تُدرج مرة واحدة فقط، عند أول ظهور لقسمها.
+    """
+    inserted = set()
+    final    = []
 
-    toc_entries: list[tuple] = []   # (level, title, pid)
-    man_items:   list[str]   = []
-    spine_refs:  list[str]   = []
+    for page in real_pages:
+        bc = page["breadcrumb"]
 
-    with zipfile.ZipFile(EPUB_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
+        # للمستويات 1-3: أدرج صفحة الفهرس عند أول ظهور
+        for depth in range(min(3, len(bc) - 1)):
+            key = (depth + 1, bc[depth])
+            if key not in inserted and key in sections:
+                inserted.add(key)
+                sec    = sections[key]
+                fid    = f"idx{depth+1}_{short_hash(sec['title'])}"
+                # breadcrumb لصفحة الفهرس = مسارها هي (للـ TOC)
+                idx_bc = bc[:depth + 1]
+                final.append({
+                    "file_id"     : fid,
+                    "title"       : sec["title"],
+                    "level"       : sec["level"],
+                    "breadcrumb"  : idx_bc,
+                    "is_index"    : True,
+                    "html_content": make_index_page_html(sec),
+                })
 
-        # mimetype — must be uncompressed & first
-        zf.writestr(
-            zipfile.ZipInfo("mimetype"),
-            "application/epub+zip",
-            compress_type=zipfile.ZIP_STORED,
-        )
+        final.append(page)
 
-        zf.writestr(
-            "META-INF/container.xml",
-            '<?xml version="1.0" encoding="utf-8"?>\n'
-            '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n'
-            '  <rootfiles>\n'
-            '    <rootfile full-path="OEBPS/content.opf"'
-            ' media-type="application/oebps-package+xml"/>\n'
-            '  </rootfiles>\n'
-            '</container>',
-        )
+    return final
 
-        zf.writestr("OEBPS/styles/book.css", EPUB_CSS)
-        zf.writestr("OEBPS/pages/cover.xhtml", _cover_xhtml(len(pages)))
 
-        man_items  = [
-            '<item id="ncx"    href="toc.ncx"         media-type="application/x-dtbncx+xml"/>',
-            '<item id="nav"    href="nav.xhtml"        media-type="application/xhtml+xml" properties="nav"/>',
-            '<item id="css"    href="styles/book.css"  media-type="text/css"/>',
-            '<item id="cover"  href="pages/cover.xhtml" media-type="application/xhtml+xml"/>',
-        ]
-        spine_refs = ['<itemref idref="cover"/>']
+# ─── TOC ─────────────────────────────────────────────────────────────
+def build_toc(pages):
+    """
+    يبني شجرة TOC من breadcrumb كل صفحة.
+    آخر عنصر في breadcrumb = عنوان الصفحة.
+    ما قبله = سلسلة الأجداد → تُنشئ Sections عند الحاجة.
+    """
+    root  = []
+    stack = []   # [(bc_title, children_list)]
 
-        for item in items:
-            fn   = item.epub_filename()
-            iid  = f"p{item.pid}"
-
-            if isinstance(item, Page):
-                zf.writestr(f"OEBPS/pages/{fn}", _page_xhtml(item))
+    def get_children(ancestors):
+        nonlocal stack, root
+        common = 0
+        for i, t in enumerate(ancestors):
+            if i < len(stack) and stack[i][0] == t:
+                common = i + 1
             else:
-                zf.writestr(f"OEBPS/pages/{fn}", _index_xhtml(item))
+                break
+        stack = stack[:common]
+        for i in range(common, len(ancestors)):
+            t        = ancestors[i]
+            children = []
+            parent   = stack[i-1][1] if i > 0 else root
+            # ابحث إن كان Section موجوداً مسبقاً (حالة نادرة)
+            parent.append((epub.Section(t, href="#"), children))
+            stack.append((t, children))
+        return stack[-1][1] if stack else root
 
-            man_items.append(
-                f'<item id="{iid}" href="pages/{fn}"'
-                ' media-type="application/xhtml+xml"/>'
-            )
-            spine_refs.append(f'<itemref idref="{iid}"/>')
-            toc_entries.append((item.level, item.title, item.pid))
+    for page in pages:
+        bc       = page["breadcrumb"]
+        href     = f"pages/{page['file_id']}.xhtml"
+        title    = page["title"]
+        ancestors = bc[:-1]
+        link     = epub.Link(href=href, title=title, uid=page["file_id"])
 
-        # content.opf
-        manifest = "\n    ".join(man_items)
-        spine    = "\n    ".join(spine_refs)
-        zf.writestr(
-            "OEBPS/content.opf",
-            f'<?xml version="1.0" encoding="utf-8"?>\n'
-            f'<package xmlns="http://www.idpf.org/2007/opf" version="3.0"'
-            f' unique-identifier="uid" xml:lang="ar">\n'
-            f'  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
-            f'    <dc:title>{BOOK_TITLE}</dc:title>\n'
-            f'    <dc:language>ar</dc:language>\n'
-            f'    <dc:identifier id="uid">{uid}</dc:identifier>\n'
-            f'  </metadata>\n'
-            f'  <manifest>\n    {manifest}\n  </manifest>\n'
-            f'  <spine toc="ncx" page-progression-direction="rtl">\n    {spine}\n  </spine>\n'
-            f'</package>',
-        )
+        if not ancestors:
+            root.append(link)
+        else:
+            children = get_children(ancestors)
+            # لصفحات الفهرس: حدّث href الـ Section الأب ليشير إليها
+            if page.get("is_index") and stack:
+                sec_entry = stack[-1]
+                parent_list = stack[-2][1] if len(stack) >= 2 else root
+                for i, e in enumerate(parent_list):
+                    if isinstance(e, tuple) and e[0].title == title:
+                        new_sec = epub.Section(title, href=href)
+                        parent_list[i] = (new_sec, e[1])
+                        break
+            children.append(link)
 
-        # toc.ncx
-        tree = _build_toc_tree(toc_entries)
-        po   = [0]
-        ncx_pts = "\n".join(_render_ncx(tree, po))
-        zf.writestr(
-            "OEBPS/toc.ncx",
-            f'<?xml version="1.0" encoding="utf-8"?>\n'
-            f'<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN"'
-            f' "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">\n'
-            f'<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">\n'
-            f'  <head>\n'
-            f'    <meta name="dtb:uid" content="{uid}"/>\n'
-            f'    <meta name="dtb:depth" content="6"/>\n'
-            f'  </head>\n'
-            f'  <docTitle><text>{BOOK_TITLE}</text></docTitle>\n'
-            f'  <navMap>\n{ncx_pts}\n  </navMap>\n'
-            f'</ncx>',
-        )
-
-        # nav.xhtml (EPUB3)
-        zf.writestr("OEBPS/nav.xhtml", _nav_xhtml(toc_entries))
-
-    print(f"  → EPUB  → {EPUB_PATH}")
+    return _flatten_toc(root)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-def main() -> None:
-    mode = f"TEST ({TEST_PAGES} صفحات)" if TEST_PAGES else "FULL"
-    print(f"=== dorar_export  [{mode}] ===\n")
+def _flatten_toc(entries):
+    result = []
+    for e in entries:
+        if isinstance(e, tuple):
+            sec, children = e
+            flat = _flatten_toc(children)
+            result.append((sec, flat) if flat else
+                          epub.Link(href=sec.href, title=sec.title, uid=sec.title[:30]))
+        else:
+            result.append(e)
+    return result
 
-    print("1) اكتشاف الصفحات…")
-    raw_pages = scrape_all()
-    print(f"   {len(raw_pages)} صفحة\n")
 
-    print("2) بناء الهيكل…")
-    items = build_document(raw_pages)
-    idx_count = sum(1 for i in items if isinstance(i, IndexPage))
-    print(f"   {len(items)} عنصر ({idx_count} فهارس تلقائية)\n")
+def build_epub(pages):
+    book = epub.EpubBook()
+    book.set_identifier("dorar-qfiqhia-2025")
+    book.set_title("موسوعة القواعد الفقهية")
+    book.set_language("ar")
+    book.add_author("الدرر السنية")
+    book.set_direction("rtl")
 
-    print("3) تصدير Markdown…")
-    export_markdown(items)
+    css_item = epub.EpubItem(uid="book_css", file_name="styles/book.css",
+                             media_type="text/css", content=BOOK_CSS.encode("utf-8"))
+    book.add_item(css_item)
 
-    print("4) بناء EPUB…")
-    export_epub(items)
+    cover_html = f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="ar" dir="rtl">
+<head><meta charset="utf-8"/><title>موسوعة القواعد الفقهية</title>
+<link rel="stylesheet" type="text/css" href="styles/book.css"/></head>
+<body style="text-align:center;padding-top:3em;">
+  <h1>موسوعة القواعد الفقهية</h1>
+  <p>الدرر السنية</p>
+  <p><a href="{INDEX}">{INDEX}</a></p>
+  <p>عدد الصفحات: {len(pages)}</p>
+</body></html>"""
+    cover = epub.EpubHtml(uid="cover", file_name="cover.xhtml", lang="ar", direction="rtl")
+    cover.content = cover_html.encode("utf-8")
+    cover.add_item(css_item)
+    book.add_item(cover)
 
-    print("\n✓ اكتمل")
+    epub_items = [cover]
+    for page in pages:
+        item = epub.EpubHtml(uid=page["file_id"],
+                             file_name=f"pages/{page['file_id']}.xhtml",
+                             lang="ar", direction="rtl")
+        item.content = page["html_content"].encode("utf-8")
+        item.add_item(css_item)
+        book.add_item(item)
+        epub_items.append(item)
+
+    book.toc   = build_toc(pages)
+    book.spine = ["nav"] + epub_items
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    os.makedirs(OUT_DIR, exist_ok=True)
+    epub.write_epub(EPUB_OUT, book)
+    print(f"\n  ✔ EPUB: {EPUB_OUT}  |  {len(pages)} صفحة  "
+          f"|  ~{os.path.getsize(EPUB_OUT)//1024} KB")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        session = make_session()
+        print("① تهيئة الجلسة...")
+        get_page(session, BASE, referer=BASE); time.sleep(1.5)
+        print("\n② جلب صفحة الفهرس...")
+        html_index = get_page(session, INDEX, referer=BASE); time.sleep(2)
+        if not html_index: raise SystemExit("فشل جلب الفهرس")
+
+        current_url = get_first_link(html_index)
+        print(f"\n③ بدء التتبع من: {current_url}\n{'='*60}")
+
+        real_pages = []
+        page_count = 0
+        visited    = set()
+        lvl_names  = {1:"باب",2:"فصل",3:"مبحث",4:"مطلب",5:"فرع",6:"مسألة"}
+
+        while current_url and current_url not in visited:
+            visited.add(current_url)
+            pid  = get_id_from_url(current_url) or page_count
+            html = get_page(session, current_url, referer=INDEX); time.sleep(DELAY)
+            if not html: break
+
+            title      = get_page_title(html)
+            breadcrumb = get_breadcrumb(html)
+            if not breadcrumb or breadcrumb[-1] != title:
+                breadcrumb.append(title)
+            level  = len(breadcrumb)
+            parsed = extract_content(html, page_id=f"p{pid}")
+            page_count += 1
+            print(f"  [{page_count}] L{level}({lvl_names.get(level,'؟')}) | "
+                  f"{title[:50]}  → {parsed['fn_count']} هامش")
+
+            real_pages.append({
+                "file_id"     : f"p{pid:05d}",
+                "url"         : current_url,
+                "title"       : title,
+                "level"       : level,
+                "breadcrumb"  : breadcrumb,
+                "is_index"    : False,
+                "html_content": build_real_page_html(title, level, current_url, parsed),
+            })
+
+            if TEST_PAGES and page_count >= TEST_PAGES:
+                print(f"\n  [اختبار] توقف عند {TEST_PAGES}"); break
+            current_url = get_next_link(html)
+
+        print(f"\n④ بناء صفحات الفهارس...")
+        sections   = build_section_tree(real_pages)
+        all_pages  = build_final_pages(real_pages, sections)
+        idx_count  = sum(1 for p in all_pages if p.get("is_index"))
+        print(f"   {idx_count} صفحة فهرس + {page_count} صفحة فعلية = {len(all_pages)} إجمالاً")
+
+        print(f"\n⑤ بناء الـ EPUB...")
+        build_epub(all_pages)
+        print("\n✔ اكتمل.")
+    except SystemExit as e: print(e)
+    except Exception: traceback.print_exc()
