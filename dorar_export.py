@@ -125,8 +125,24 @@ Item = Page | IndexPage
 
 # ── Discovery ────────────────────────────────────────────────────────────────
 def discover_urls() -> list[str]:
+    # الخطوة 1: اجمع كل روابط المحتوى من صفحة الفهرس
+    print(f"  جلب فهرس الروابط من {START_URL}…")
+    index_soup = fetch(START_URL)
+    all_ids: set[int] = set()
+    if index_soup:
+        for a in index_soup.find_all("a", href=True):
+            m = PAGE_RE.search(a["href"])
+            if m:
+                all_ids.add(int(m.group(1)))
+    if not all_ids:
+        print("  [تحذير] لم يُعثر على روابط في صفحة الفهرس")
+        return []
+
+    # الخطوة 2: ابدأ من أصغر رقم واتبع زر التالي
+    base = "https://dorar.net"
+    url  = f"{base}/alakhlaq/{min(all_ids)}"
     urls, seen = [], set()
-    url = START_URL
+
     while url:
         if url in seen:
             break
@@ -135,11 +151,12 @@ def discover_urls() -> list[str]:
         print(f"  [{len(urls):>4}] {url}")
         if TEST_PAGES and len(urls) >= TEST_PAGES:
             break
+        time.sleep(DELAY)
         soup = fetch(url)
         if not soup:
             break
-        time.sleep(DELAY)
         url = _next_url(soup, url)
+
     return urls
 
 
