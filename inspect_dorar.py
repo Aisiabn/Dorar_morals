@@ -1,11 +1,9 @@
 """
-inspect_dorar.py — يفحص بنية HTML لصفحة من dorar.net
-شغّله: python inspect_dorar.py
+inspect_dorar.py — يفحص بنية dorar.net/alakhlaq
 """
 import requests
 from bs4 import BeautifulSoup
 
-URL = "https://dorar.net/akhlaq/1"
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 "
@@ -14,51 +12,75 @@ HEADERS = {
     "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
 }
 
-r = requests.get(URL, headers=HEADERS, timeout=20)
-print(f"Status: {r.status_code}\n")
-soup = BeautifulSoup(r.text, "html.parser")
+def fetch(url):
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    print(f"\n{'='*60}")
+    print(f"URL   : {url}")
+    print(f"Status: {r.status_code}")
+    return BeautifulSoup(r.text, "html.parser") if r.status_code == 200 else None
 
-# ── 1. og:title و title ──────────────────────────────────────────────────
-og = soup.find("meta", property="og:title")
-print(f"og:title   : {og['content'] if og else 'NOT FOUND'}")
-print(f"<title>    : {soup.title.text.strip() if soup.title else 'NOT FOUND'}")
+# ── الخطوة 1: صفحة الفهرس — اكتشف روابط المحتوى ──────────────────────────
+soup = fetch("https://dorar.net/alakhlaq")
+if soup:
+    print("\n── كل الروابط الداخلية (/akhlaq أو /morals أو /alakhlaq) ──")
+    found = set()
+    for a in soup.find_all("a", href=True):
+        h = a["href"]
+        if any(x in h for x in ["/akhlaq", "/morals", "/alakhlaq"]):
+            found.add(h)
+    for h in sorted(found)[:30]:
+        print(f"  {h}")
 
-# ── 2. Breadcrumb ─────────────────────────────────────────────────────────
-print("\n── Breadcrumb elements ──")
-for el in soup.find_all(class_=True):
-    cls = " ".join(el.get("class", []))
-    if "breadcrumb" in cls.lower():
-        print(f"  TAG={el.name}  CLASS={cls}")
-        print(f"  TEXT={el.get_text(' > ', strip=True)[:120]}")
-        break
+# ── الخطوة 2: جرب أول رابط محتوى ─────────────────────────────────────────
+CONTENT_URL = "https://dorar.net/akhlaq/2"   # سنغيره بناءً على نتيجة أعلاه
+soup2 = fetch(CONTENT_URL)
+if soup2:
+    og = soup2.find("meta", property="og:title")
+    print(f"\nog:title : {og['content'] if og else 'NOT FOUND'}")
 
-# ── 3. زر التالي ──────────────────────────────────────────────────────────
-print("\n── Next page links ──")
-for a in soup.find_all("a", href=True):
-    t = a.get_text(strip=True)
-    if any(x in t for x in ["التالي", "›", "»", "next"]):
-        print(f"  TEXT={t!r}  HREF={a['href']}")
+    print("\n── Breadcrumb ──")
+    bc = soup2.find("ol", class_="breadcrumb")
+    if bc:
+        items = [li.get_text(strip=True) for li in bc.find_all("li")]
+        print("  " + " > ".join(items))
 
-# ── 4. حاوية المحتوى الرئيسي ─────────────────────────────────────────────
-print("\n── Main content containers (first 5) ──")
-candidates = []
-for tag in ["main", "article", "section", "div"]:
-    for el in soup.find_all(tag, class_=True):
-        cls = " ".join(el.get("class", []))
-        candidates.append((tag, cls, len(el.get_text())))
-candidates.sort(key=lambda x: -x[2])
-for tag, cls, length in candidates[:5]:
-    print(f"  <{tag}> class={cls!r}  textlen={length}")
+    print("\n── Next page links ──")
+    for a in soup2.find_all("a", href=True):
+        t = a.get_text(strip=True)
+        if any(x in t for x in ["التالي", "›", "»", "next", "السابق", "‹", "«"]):
+            print(f"  TEXT={t!r}  HREF={a['href']}")
 
-# ── 5. الـ classes الخاصة (tip, aaya, hadith …) ───────────────────────────
-print("\n── Special span classes found ──")
-special = set()
-for span in soup.find_all("span", class_=True):
-    for c in span.get("class", []):
-        special.add(c)
-print("  ", special)
+    print("\n── أكبر 5 حاويات محتوى ──")
+    candidates = []
+    for tag in ["main", "article", "section", "div"]:
+        for el in soup2.find_all(tag, class_=True):
+            cls = " ".join(el.get("class", []))
+            txt = el.get_text()
+            if len(txt) > 200:
+                candidates.append((tag, cls, len(txt)))
+    candidates.sort(key=lambda x: -x[2])
+    seen = set()
+    for tag, cls, ln in candidates:
+        if cls not in seen:
+            seen.add(cls)
+            print(f"  <{tag}> class={cls!r}  textlen={ln}")
+        if len(seen) >= 5:
+            break
 
-# ── 6. عناصر مهمة أخرى ───────────────────────────────────────────────────
-print("\n── h1/h2/h3 tags ──")
-for h in soup.find_all(["h1","h2","h3"]):
-    print(f"  <{h.name}> class={h.get('class',[])}  text={h.get_text(strip=True)[:80]}")
+    print("\n── Special span classes ──")
+    special = set()
+    for span in soup2.find_all("span", class_=True):
+        for c in span.get("class", []):
+            special.add(c)
+    print(" ", special)
+
+    print("\n── h1/h2/h3 ──")
+    for h in soup2.find_all(["h1","h2","h3"]):
+        print(f"  <{h.name}> class={h.get('class',[])}  text={h.get_text(strip=True)[:80]}")
+
+    print("\n── data-* attributes (tips/footnotes) ──")
+    for el in soup2.find_all(True):
+        attrs = {k:v for k,v in el.attrs.items() if k.startswith("data-")}
+        if attrs:
+            print(f"  <{el.name}> {attrs}")
+            break  # أول واحد فقط كمثال
