@@ -32,7 +32,7 @@ if soup:
         print(f"  {h}")
 
 # ── الخطوة 2: جرب أول رابط محتوى ─────────────────────────────────────────
-CONTENT_URL = "https://dorar.net/akhlaq/2"   # سنغيره بناءً على نتيجة أعلاه
+CONTENT_URL = "https://dorar.net/alakhlaq/10"
 soup2 = fetch(CONTENT_URL)
 if soup2:
     og = soup2.find("meta", property="og:title")
