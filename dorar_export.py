@@ -205,13 +205,18 @@ def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str,
 
     for sel in REMOVE_SELECTORS:
         for el in body.select(sel):
+            # إن كان h3#more-titles احذف الـ ul بعده أيضاً
+            if getattr(el, "name", "") == "h3" and el.get("id") == "more-titles":
+                nxt = el.find_next_sibling("ul")
+                if nxt:
+                    nxt.decompose()
             el.decompose()
 
     for a in body.find_all("a"):
         if NAV_TEXT_RE.search(a.get_text()):
             a.decompose()
 
-    # احذف قسم "انظر أيضا" وكل ما بعده
+    # احذف قسم "انظر أيضا" إن بقي (fallback)
     for h3 in body.find_all("h3", class_="default-text-color"):
         if "انظر" in h3.get_text():
             # احذف كل العناصر اللي بعده
