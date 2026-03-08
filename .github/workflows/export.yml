@@ -44,7 +44,7 @@ jobs:
         if: ${{ github.event.inputs.mode == 'export' }}
         env:
           TEST_PAGES: ${{ github.event.inputs.test_pages }}
-        run: python morals_export.py
+        run: python dorar_export.py
 
       - name: Commit and push output
         if: ${{ github.event.inputs.mode == 'export' }}
