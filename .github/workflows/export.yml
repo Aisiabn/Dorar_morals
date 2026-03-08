@@ -1,0 +1,43 @@
+name: Export Dorar Encyclopedia
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_pages:
+        description: "عدد صفحات للاختبار (0 = كامل)"
+        required: false
+        default: "0"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run exporter
+        env:
+          TEST_PAGES: ${{ github.event.inputs.test_pages }}
+        run: python morals_export.py
+
+      - name: Commit and push output
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: export encyclopedia [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+          git push
