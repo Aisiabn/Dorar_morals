@@ -230,7 +230,7 @@ def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str,
 
     # Process tips in reverse so counter matches document order after reversal
     tips = list(body.find_all(class_="tip"))
-    for span in reversed(tips):
+    for span in tips:
         fn_text = (
             span.get("data-original-title")
             or span.get("data-content")
@@ -239,7 +239,7 @@ def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str,
         )
         fn_n += 1
         fn_id = f"fn-{pid}-{fn_n}"
-        footnotes.insert(0, (fn_id, fn_text))
+        footnotes.append((fn_id, fn_text))
         anchor = BeautifulSoup(
             f'<sup><a href="#{fn_id}">[{fn_n}]</a></sup>', "html.parser"
         )
@@ -664,7 +664,7 @@ def export_epub(items: list[Item]) -> None:
             f'    <dc:identifier id="uid">{uid}</dc:identifier>\n'
             f'  </metadata>\n'
             f'  <manifest>\n    {manifest}\n  </manifest>\n'
-            f'  <spine toc="ncx">\n    {spine}\n  </spine>\n'
+            f'  <spine toc="ncx" page-progression-direction="rtl">\n    {spine}\n  </spine>\n'
             f'</package>',
         )
 
