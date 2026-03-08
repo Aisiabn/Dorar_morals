@@ -241,7 +241,7 @@ def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str,
         fn_id = f"fn-{pid}-{fn_n}"
         footnotes.append((fn_id, fn_text))
         anchor = BeautifulSoup(
-            f'<sup><a href="#{fn_id}">[{fn_n}]</a></sup>', "html.parser"
+            f'<sup id="ref-{fn_id}"><a href="#{fn_id}">[{fn_n}]</a></sup>', "html.parser"
         )
         span.replace_with(anchor)
 
@@ -451,15 +451,22 @@ EPUB_CSS = """\
 body {
     direction: rtl;
     font-family: Amiri, "Traditional Arabic", "Scheherazade New", Arial, sans-serif;
+    font-size: 1em;
     line-height: 1.9;
     margin: 1em 2em;
     color: #333;
 }
 h1, h2, h3, h4, h5, h6 {
-    font-size: 1.1em;
+    font-size: 1em;
     color: #2c3e50;
     margin: 1em 0 0.4em;
     font-weight: bold;
+}
+p, li, td, th, span, div {
+    font-size: 1em;
+}
+* {
+    font-size: inherit;
 }
 p { margin: 0.4em 0 0.9em; text-align: justify; }
 .ayah  { color: #1a5276; }
@@ -499,7 +506,7 @@ def _page_xhtml(p: Page) -> str:
     fn_sec = ""
     if p.footnotes:
         items = "".join(
-            f'<li id="{fid}"><sup>[{fid.split("-")[-1]}]</sup> {txt}</li>'
+            f'<li id="{fid}"><sup>[{fid.split("-")[-1]}]</sup> {txt} <a href="#ref-{fid}">↑</a></li>'
             for fid, txt in p.footnotes
         )
         fn_sec = f'<div class="footnotes"><ol>{items}</ol></div>'
