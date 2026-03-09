@@ -690,10 +690,7 @@ def main() -> None:
     idx_count = sum(1 for i in items if isinstance(i, IndexPage))
     print(f"   {len(items)} عنصر ({idx_count} فهارس تلقائية)\n")
 
-    print("3) تصدير Markdown…")
-    export_markdown(items)
-
-    print("4) بناء EPUB…")
+    print("3) بناء EPUB…")
     export_epub(items)
 
     print("\n✓ اكتمل")
