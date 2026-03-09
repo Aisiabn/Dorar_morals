@@ -23,7 +23,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 START_URL    = "https://dorar.net/alakhlaq"
 PAGE_RE      = re.compile(r"/alakhlaq/(\d+)")
 SKIP_CRUMBS  = 2
-DELAY        = 1.0
+DELAY        = 0.5
 TIMEOUT      = 20
 TEST_PAGES   = int(os.getenv("TEST_PAGES") or 0)
 OUT_DIR      = Path("output")
