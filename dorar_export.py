@@ -20,8 +20,10 @@ import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 # ── Config ────────────────────────────────────────────────────────────────────
-START_URL   = "https://dorar.net/alakhlaq"
-PAGE_RE     = re.compile(r"/alakhlaq/(\d+)")
+START_URL    = "https://dorar.net/alakhlaq"
+REFS_URL     = "https://dorar.net/refs/alakhlaq"
+ARTICLE_URL  = "https://dorar.net/article/1988"
+PAGE_RE      = re.compile(r"/alakhlaq/(\d+)")
 SKIP_CRUMBS = 2
 DELAY       = 0.5
 TIMEOUT     = 20
@@ -250,6 +252,50 @@ def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str,
             span.replace_with(BeautifulSoup(f"<h5>{txt}</h5>", "html.parser"))
 
     return body.decode_contents(), footnotes
+
+
+# ── Special Pages ─────────────────────────────────────────────────────────────
+def scrape_special_page(url: str, pid: str, title: str, level: int) -> Page | None:
+    """جلب صفحة خاصة (مقدمة أو مراجع) وتحويلها إلى Page."""
+    print(f"  special [{pid}]: {url}")
+    soup = fetch(url)
+    if not soup:
+        return None
+
+    # محاولة استخراج العنوان الفعلي من الصفحة
+    real_title = page_title(soup)
+    if real_title and real_title != "بدون عنوان":
+        title = real_title
+
+    # للمراجع: المحتوى في حاوية مختلفة — نحاول عدة مسارات
+    body_html, footnotes = "", []
+    if "/refs/" in url:
+        body_html = _extract_refs_content(soup)
+    else:
+        body_html, footnotes = extract_content(soup, pid)
+
+    bc = [BOOK_TITLE, title]
+    return Page(pid=pid, url=url, title=title, level=level,
+                breadcrumb=bc, body_html=body_html, footnotes=footnotes)
+
+
+def _extract_refs_content(soup: BeautifulSoup) -> str:
+    """استخراج محتوى صفحة المراجع — بنية مختلفة عن صفحات الموسوعة."""
+    # الحاوية الرئيسية
+    for selector in ["div#cntnt", "div.container", "main", "article"]:
+        tag, *cls = selector.lstrip("#.").split(".")
+        el = soup.find(selector.split("#")[0].split(".")[0],
+                       id=selector.split("#")[1] if "#" in selector else None,
+                       class_=cls[0] if cls else None)
+        if el:
+            # احذف النصوص التنقلية
+            for rm in el.find_all(["nav", "header", "footer", "script", "style"]):
+                rm.decompose()
+            return el.decode_contents()
+
+    # fallback: كل body
+    body = soup.find("body")
+    return body.decode_contents() if body else ""
 
 
 # ── Scrape All ────────────────────────────────────────────────────────────────
@@ -653,19 +699,29 @@ def main() -> None:
     mode = f"TEST ({TEST_PAGES} صفحات)" if TEST_PAGES else "FULL"
     print(f"=== dorar_export  [{mode}] ===\n")
 
-    print("1) اكتشاف الصفحات…")
+    print("1) جلب الصفحات الخاصة…")
+    intro = scrape_special_page(ARTICLE_URL, "intro", "مقدمة الموسوعة", level=1)
+    refs  = scrape_special_page(REFS_URL,    "refs",  "المراجع المعتمدة", level=1)
+
+    print("\n2) اكتشاف صفحات الموسوعة…")
     raw_pages = scrape_all()
     print(f"   {len(raw_pages)} صفحة\n")
 
-    print("2) بناء الهيكل…")
+    print("3) بناء الهيكل…")
     items = build_document(raw_pages)
+
+    # أضف المقدمة في البداية والمراجع في النهاية
+    if intro:
+        items = [intro] + items
+    if refs:
+        items = items + [refs]
     idx_count = sum(1 for i in items if isinstance(i, IndexPage))
     print(f"   {len(items)} عنصر ({idx_count} فهارس تلقائية)\n")
 
-    print("3) بناء EPUB…")
+    print("4) بناء EPUB…")
     export_epub(items)
 
-    print("4) بناء Markdown…")
+    print("5) بناء Markdown…")
     export_markdown(items)
 
     print("\n✓ اكتمل")
