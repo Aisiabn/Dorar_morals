@@ -12,7 +12,7 @@ import time
 import uuid
 import zipfile
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -20,16 +20,16 @@ import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 # ── Config ────────────────────────────────────────────────────────────────────
-START_URL    = "https://dorar.net/alakhlaq"
-PAGE_RE      = re.compile(r"/alakhlaq/(\d+)")
-SKIP_CRUMBS  = 2
-DELAY        = 0.5
-TIMEOUT      = 20
-TEST_PAGES   = int(os.getenv("TEST_PAGES") or 0)
-OUT_DIR      = Path("output")
-EPUB_PATH    = OUT_DIR / "morals.epub"
-MD_DIR       = OUT_DIR / "md"
-BOOK_TITLE   = "موسوعة الأخلاق والسلوك"
+START_URL   = "https://dorar.net/alakhlaq"
+PAGE_RE     = re.compile(r"/alakhlaq/(\d+)")
+SKIP_CRUMBS = 2
+DELAY       = 0.5
+TIMEOUT     = 20
+TEST_PAGES  = int(os.getenv("TEST_PAGES") or 0)
+OUT_DIR     = Path("output")
+EPUB_PATH   = OUT_DIR / "morals.epub"
+MD_DIR      = OUT_DIR / "md"
+BOOK_TITLE  = "موسوعة الأخلاق والسلوك"
 
 HEADERS = {
     "User-Agent": (
@@ -39,9 +39,7 @@ HEADERS = {
     "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
 }
 
-LEVEL_NAMES    = {1: "باب", 2: "فصل", 3: "مبحث", 4: "مطلب", 5: "فرع", 6: "مسألة"}
 CHILDREN_NAMES = {1: "فصل", 2: "مبحث", 3: "مطلب", 4: "فرع", 5: "مسألة"}
-INDEX_LEVELS   = {1, 2, 3}
 
 PUA_RE  = re.compile(r"[\ue000-\uf8ff]")
 SAFE_RE = re.compile(r'[\\/:*?"<>|]')
@@ -50,12 +48,6 @@ NAV_TEXT_RE = re.compile(
     r"السابق|التالي|انظر\s+أيض|الرابط\s+المختصر|مشاركة|share",
     re.I,
 )
-
-REMOVE_SELECTORS = [
-    "nav", "header", "footer", "script", "style", "form",
-    ".card-title", ".dorar-bg-lightGreen", ".collapse",
-    "h3#more-titles",
-]
 
 # ── HTTP Session ──────────────────────────────────────────────────────────────
 _session = requests.Session()
@@ -76,13 +68,13 @@ def fetch(url: str) -> BeautifulSoup | None:
 # ── Data Classes ──────────────────────────────────────────────────────────────
 @dataclass
 class Page:
-    pid:          str
-    url:          str
-    title:        str
-    level:        int
-    breadcrumb:   list[str]
-    body_html:    str
-    footnotes:    list[tuple[str, str]]
+    pid:        str
+    url:        str
+    title:      str
+    level:      int
+    breadcrumb: list[str]
+    body_html:  str
+    footnotes:  list[tuple[str, str]]
 
     def epub_filename(self) -> str:
         return f"p{self.pid}.xhtml"
@@ -120,6 +112,11 @@ def _count_phrase(n: int, child_type: str) -> str:
             "فرع": "فرعاً", "مسألة": "مسألةً",
         }
         return f"وفيه {n} {plurals.get(child_type, child_type)}"
+
+
+def safe_name(s: str, maxlen: int = 80) -> str:
+    s = SAFE_RE.sub("", s).replace(" ", "_")
+    return s[:maxlen]
 
 
 # ── Discovery ─────────────────────────────────────────────────────────────────
@@ -162,8 +159,7 @@ def _next_url(soup: BeautifulSoup, current: str) -> str | None:
         href = a["href"]
         if not PAGE_RE.search(href):
             continue
-        txt = a.get_text(strip=True)
-        if txt == "التالي":
+        if a.get_text(strip=True) == "التالي":
             return urljoin(current, href)
     return None
 
@@ -200,8 +196,7 @@ def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str,
     body = BeautifulSoup(str(body), "html.parser")
 
     for a in body.find_all("a", href=True):
-        href = a.get("href", "")
-        if "/hadith/sharh/" in href or "/tafseer/" in href:
+        if "/hadith/sharh/" in a["href"] or "/tafseer/" in a["href"]:
             a.decompose()
 
     for h3 in body.find_all("h3", id="more-titles"):
@@ -250,11 +245,9 @@ def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str,
         elif "sora" in cls:
             span.replace_with(PUA_RE.sub("", txt))
         elif "title-2" in cls:
-            h = BeautifulSoup(f"<h4>{txt}</h4>", "html.parser")
-            span.replace_with(h)
+            span.replace_with(BeautifulSoup(f"<h4>{txt}</h4>", "html.parser"))
         elif "title-1" in cls:
-            h = BeautifulSoup(f"<h5>{txt}</h5>", "html.parser")
-            span.replace_with(h)
+            span.replace_with(BeautifulSoup(f"<h5>{txt}</h5>", "html.parser"))
 
     return body.decode_contents(), footnotes
 
@@ -275,7 +268,6 @@ def scrape_all() -> list[Page]:
 
         title = page_title(soup)
         bc    = page_breadcrumb(soup)
-
         if not bc or bc[-1] != title:
             bc.append(title)
 
@@ -294,20 +286,20 @@ def build_document(pages: list[Page]) -> list[Item]:
     for p in pages:
         ancestors = p.breadcrumb[SKIP_CRUMBS:]
         for depth in range(min(len(ancestors) - 1, 3)):
-            parent_key = tuple(ancestors[: depth + 1])
+            parent_key = tuple(ancestors[:depth + 1])
             child_name = ancestors[depth + 1] if depth + 1 < len(ancestors) else p.title
             kids = section_children[parent_key]
             if child_name not in kids:
                 kids.append(child_name)
 
     seen_idx: set[tuple] = set()
-    idx_n    = 0
+    idx_n = 0
     result: list[Item] = []
 
     for p in pages:
         ancestors = p.breadcrumb[SKIP_CRUMBS:]
         for depth in range(min(len(ancestors) - 1, 3)):
-            key   = tuple(ancestors[: depth + 1])
+            key   = tuple(ancestors[:depth + 1])
             level = depth + 1
             if key not in seen_idx:
                 seen_idx.add(key)
@@ -326,15 +318,6 @@ def build_document(pages: list[Page]) -> list[Item]:
 
 
 # ── Markdown Export ───────────────────────────────────────────────────────────
-def safe_name(s: str, maxlen: int = 80) -> str:
-    s = SAFE_RE.sub("", s).replace(" ", "_")
-    return s[:maxlen]
-
-
-def _ancestors_dirs(bc: list[str]) -> list[str]:
-    return [safe_name(s) for s in bc[SKIP_CRUMBS:-1]]
-
-
 def html_to_md(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
@@ -370,32 +353,36 @@ def export_markdown(items: list[Item]) -> None:
     MD_DIR.mkdir(parents=True, exist_ok=True)
     section_dirs: dict[tuple, Path] = {}
 
-    def _section_dir(bc: list[str], depth: int) -> Path:
-        key = tuple(bc[SKIP_CRUMBS: SKIP_CRUMBS + depth + 1])
-        if key not in section_dirs:
-            parts = [safe_name(s) for s in bc[SKIP_CRUMBS: SKIP_CRUMBS + depth + 1]]
-            section_dirs[key] = MD_DIR.joinpath(*parts)
-        return section_dirs[key]
-
     for item in items:
-        if isinstance(item, Page):
-            parts  = _ancestors_dirs(item.breadcrumb)
-            folder = MD_DIR.joinpath(*parts) if parts else MD_DIR
-            folder.mkdir(parents=True, exist_ok=True)
-            fname  = f"{item.pid}_{safe_name(item.title)}.md"
-            hashes = "#" * item.level
-            md     = html_to_md(item.body_html)
-            fn_block = ""
-            if item.footnotes:
-                lines = [f"[^{fid.split('-')[-1]}]: {txt}"
-                         for fid, txt in item.footnotes]
-                fn_block = "\n\n---\n\n" + "\n".join(lines)
-            content = (
-                f"{hashes} {item.title}\n\n"
-                f"> المصدر: {item.url}\n\n"
-                f"{md}{fn_block}\n"
-            )
-            (folder / fname).write_text(content, encoding="utf-8")
+        if not isinstance(item, Page):
+            continue
+
+        ancestors = item.breadcrumb[SKIP_CRUMBS:]
+
+        # ✅ الإصلاح: تسجيل كل مسارات الأجداد في section_dirs
+        for d in range(len(ancestors) - 1):
+            key = tuple(ancestors[:d + 1])
+            if key not in section_dirs:
+                parts = [safe_name(s) for s in ancestors[:d + 1]]
+                section_dirs[key] = MD_DIR.joinpath(*parts)
+
+        parts  = [safe_name(s) for s in ancestors[:-1]]
+        folder = MD_DIR.joinpath(*parts) if parts else MD_DIR
+        folder.mkdir(parents=True, exist_ok=True)
+
+        fname    = f"{item.pid}_{safe_name(item.title)}.md"
+        hashes   = "#" * item.level
+        md       = html_to_md(item.body_html)
+        fn_block = ""
+        if item.footnotes:
+            lines    = [f"[^{fid.split('-')[-1]}]: {txt}" for fid, txt in item.footnotes]
+            fn_block = "\n\n---\n\n" + "\n".join(lines)
+        content = (
+            f"{hashes} {item.title}\n\n"
+            f"> المصدر: {item.url}\n\n"
+            f"{md}{fn_block}\n"
+        )
+        (folder / fname).write_text(content, encoding="utf-8")
 
     for item in items:
         if not isinstance(item, IndexPage):
@@ -435,12 +422,8 @@ h1, h2, h3, h4, h5, h6 {
     margin: 1em 0 0.4em;
     font-weight: bold;
 }
-p, li, td, th, span, div {
-    font-size: 1em;
-}
-* {
-    font-size: inherit;
-}
+p, li, td, th, span, div { font-size: 1em; }
+* { font-size: inherit; }
 p { margin: 0.4em 0 0.9em; text-align: justify; }
 .ayah   { color: #1a5276; }
 .hadith { color: #1e8449; }
@@ -492,8 +475,7 @@ def _index_xhtml(ip: IndexPage) -> str:
     phrase     = _count_phrase(len(ip.children), child_type)
     h          = f"<h{ip.level}>{ip.title}</h{ip.level}>"
     lis        = "".join(f"<li>{c}</li>" for c in ip.children)
-    body       = f"{h}\n<p>{phrase}:</p>\n<ol>{lis}</ol>"
-    return _xhtml(ip.title, body)
+    return _xhtml(ip.title, f"{h}\n<p>{phrase}:</p>\n<ol>{lis}</ol>")
 
 
 def _cover_xhtml(total_pages: int) -> str:
@@ -528,7 +510,6 @@ def _render_ncx(nodes: list[dict], po: list, indent: int = 4) -> list[str]:
         lines += [
             f'{sp}<navPoint id="np-{n["pid"]}" playOrder="{po[0]}">',
             f'{sp}  <navLabel><text>{n["title"]}</text></navLabel>',
-            # ✅ الإصلاح: إضافة "p" قبل pid
             f'{sp}  <content src="pages/p{n["pid"]}.xhtml"/>',
         ]
         if n["children"]:
@@ -543,7 +524,6 @@ def _render_nav_ol(nodes: list[dict], indent: int = 2) -> list[str]:
     sp    = " " * indent
     lines = [f"{sp}<ol>"]
     for n in nodes:
-        # ✅ الإصلاح: إضافة "p" قبل pid
         href = f'pages/p{n["pid"]}.xhtml'
         if n["children"]:
             lines.append(f'{sp}  <li><a href="{href}">{n["title"]}</a>')
@@ -623,8 +603,7 @@ def export_epub(items: list[Item]) -> None:
                 zf.writestr(f"OEBPS/pages/{fn}", _index_xhtml(item))
 
             man_items.append(
-                f'<item id="{iid}" href="pages/{fn}"'
-                ' media-type="application/xhtml+xml"/>'
+                f'<item id="{iid}" href="pages/{fn}" media-type="application/xhtml+xml"/>'
             )
             spine_refs.append(f'<itemref idref="{iid}"/>')
             toc_entries.append((item.level, item.title, item.pid))
