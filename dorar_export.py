@@ -188,44 +188,37 @@ def page_breadcrumb(soup: BeautifulSoup) -> list[str]:
 
 
 def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str, str]]]:
-    # الحاوية الرئيسية
     cntnt = soup.find("div", id="cntnt")
     if not cntnt:
         cntnt = soup.find("div", class_=lambda c: c and "amiri_custom_content" in c)
     if not cntnt:
         return "", []
 
-    # المحتوى الفعلي في div.w-100.mt-4
     body = cntnt.find("div", class_=lambda c: c and "w-100" in c and "mt-4" in c)
     if not body:
         body = cntnt
     body = BeautifulSoup(str(body), "html.parser")
 
-    # احذف روابط الشرح الخارجية داخل الأحاديث
     for a in body.find_all("a", href=True):
         href = a.get("href", "")
         if "/hadith/sharh/" in href or "/tafseer/" in href:
             a.decompose()
 
-    # احذف h3#more-titles والـ ul بعده
     for h3 in body.find_all("h3", id="more-titles"):
         nxt = h3.find_next_sibling("ul")
         if nxt:
             nxt.decompose()
         h3.decompose()
 
-    # احذف span.scroll-pos (زر الهوامش)
     for el in body.find_all("span", class_="scroll-pos"):
         el.decompose()
 
-    # احذف hr والتنقل السابق/التالي
     for hr in body.find_all("hr"):
         nxt = hr.find_next_sibling()
         if nxt:
             nxt.decompose()
         hr.decompose()
 
-    # احذف بقية الروابط غير المرغوبة
     for a in body.find_all("a"):
         if NAV_TEXT_RE.search(a.get_text()):
             a.decompose()
@@ -233,7 +226,6 @@ def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str,
     footnotes: list[tuple[str, str]] = []
     fn_n = 0
 
-    # الـ tips: النص مباشرة داخل الـ span
     for span in body.find_all("span", class_="tip"):
         fn_text = span.get_text(strip=True)
         fn_n += 1
@@ -247,7 +239,6 @@ def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str,
 
     for span in body.find_all("span"):
         cls = set(span.get("class", []))
-        # نجمع النص بعد حذف الروابط
         for a in span.find_all("a"):
             a.decompose()
         txt = span.get_text(strip=True)
@@ -537,7 +528,8 @@ def _render_ncx(nodes: list[dict], po: list, indent: int = 4) -> list[str]:
         lines += [
             f'{sp}<navPoint id="np-{n["pid"]}" playOrder="{po[0]}">',
             f'{sp}  <navLabel><text>{n["title"]}</text></navLabel>',
-            f'{sp}  <content src="pages/{n["pid"]}.xhtml"/>',
+            # ✅ الإصلاح: إضافة "p" قبل pid
+            f'{sp}  <content src="pages/p{n["pid"]}.xhtml"/>',
         ]
         if n["children"]:
             lines += _render_ncx(n["children"], po, indent + 2)
@@ -551,7 +543,8 @@ def _render_nav_ol(nodes: list[dict], indent: int = 2) -> list[str]:
     sp    = " " * indent
     lines = [f"{sp}<ol>"]
     for n in nodes:
-        href = f'pages/{n["pid"]}.xhtml'
+        # ✅ الإصلاح: إضافة "p" قبل pid
+        href = f'pages/p{n["pid"]}.xhtml'
         if n["children"]:
             lines.append(f'{sp}  <li><a href="{href}">{n["title"]}</a>')
             lines += _render_nav_ol(n["children"], indent + 4)
@@ -653,8 +646,8 @@ def export_epub(items: list[Item]) -> None:
             f'</package>',
         )
 
-        tree   = _build_toc_tree(toc_entries)
-        po     = [0]
+        tree    = _build_toc_tree(toc_entries)
+        po      = [0]
         ncx_pts = "\n".join(_render_ncx(tree, po))
         zf.writestr(
             "OEBPS/toc.ncx",
@@ -692,6 +685,9 @@ def main() -> None:
 
     print("3) بناء EPUB…")
     export_epub(items)
+
+    print("4) بناء Markdown…")
+    export_markdown(items)
 
     print("\n✓ اكتمل")
 
