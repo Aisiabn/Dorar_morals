@@ -188,32 +188,44 @@ def page_breadcrumb(soup: BeautifulSoup) -> list[str]:
 
 
 def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str, str]]]:
-    body = (
-        soup.find("div", class_=lambda c: c and "col-12" in c and "position-relative" in c)
-        or soup.find("div", class_=lambda c: c and "col-12" in c and "col-lg-11" in c)
-        or soup.find("div", class_=lambda c: c and "amiri_custom_content" in c)
-    )
-    if not body:
+    # الحاوية الرئيسية
+    cntnt = soup.find("div", id="cntnt")
+    if not cntnt:
+        cntnt = soup.find("div", class_=lambda c: c and "amiri_custom_content" in c)
+    if not cntnt:
         return "", []
 
+    # المحتوى الفعلي في div.w-100.mt-4
+    body = cntnt.find("div", class_=lambda c: c and "w-100" in c and "mt-4" in c)
+    if not body:
+        body = cntnt
     body = BeautifulSoup(str(body), "html.parser")
 
-    for sel in REMOVE_SELECTORS:
-        for el in body.select(sel):
-            if getattr(el, "name", "") == "h3" and el.get("id") == "more-titles":
-                nxt = el.find_next_sibling("ul")
-                if nxt:
-                    nxt.decompose()
-            el.decompose()
+    # احذف روابط الشرح الخارجية داخل الأحاديث
+    for a in body.find_all("a", href=True):
+        href = a.get("href", "")
+        if "/hadith/sharh/" in href or "/tafseer/" in href:
+            a.decompose()
 
-    # احذف قسم "انظر أيضا" إن بقي (fallback)
-    for h3 in body.find_all("h3", class_="default-text-color"):
-        if "انظر" in h3.get_text():
-            for sib in list(h3.find_next_siblings()):
-                sib.decompose()
-            h3.decompose()
-            break
+    # احذف h3#more-titles والـ ul بعده
+    for h3 in body.find_all("h3", id="more-titles"):
+        nxt = h3.find_next_sibling("ul")
+        if nxt:
+            nxt.decompose()
+        h3.decompose()
 
+    # احذف span.scroll-pos (زر الهوامش)
+    for el in body.find_all("span", class_="scroll-pos"):
+        el.decompose()
+
+    # احذف hr والتنقل السابق/التالي
+    for hr in body.find_all("hr"):
+        nxt = hr.find_next_sibling()
+        if nxt:
+            nxt.decompose()
+        hr.decompose()
+
+    # احذف بقية الروابط غير المرغوبة
     for a in body.find_all("a"):
         if NAV_TEXT_RE.search(a.get_text()):
             a.decompose()
@@ -221,13 +233,9 @@ def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str,
     footnotes: list[tuple[str, str]] = []
     fn_n = 0
 
-    for span in body.find_all(class_="tip"):
-        fn_text = (
-            span.get("data-original-title")
-            or span.get("data-content")
-            or span.get("data-tippy-content")
-            or span.get_text(strip=True)
-        )
+    # الـ tips: النص مباشرة داخل الـ span
+    for span in body.find_all("span", class_="tip"):
+        fn_text = span.get_text(strip=True)
         fn_n += 1
         fn_id = f"fn-{pid}-{fn_n}"
         footnotes.append((fn_id, fn_text))
@@ -239,7 +247,10 @@ def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str,
 
     for span in body.find_all("span"):
         cls = set(span.get("class", []))
-        txt = span.get_text()
+        # نجمع النص بعد حذف الروابط
+        for a in span.find_all("a"):
+            a.decompose()
+        txt = span.get_text(strip=True)
 
         if "aaya" in cls:
             span.replace_with(f"﴿{txt}﴾")
