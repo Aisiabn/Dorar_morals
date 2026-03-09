@@ -6,11 +6,11 @@ on:
       mode:
         description: "الوضع"
         required: true
-        default: "inspect"
+        default: "export"
         type: choice
         options:
-          - inspect
           - export
+          - inspect
       test_pages:
         description: "عدد صفحات للتصدير (0 = كامل) — يُستخدم فقط في وضع export"
         required: false
