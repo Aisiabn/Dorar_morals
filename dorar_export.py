@@ -255,6 +255,32 @@ def extract_content(soup: BeautifulSoup, pid: str) -> tuple[str, list[tuple[str,
 
 
 # ── Special Pages ─────────────────────────────────────────────────────────────
+def _normalize_article_html(body: BeautifulSoup) -> None:
+    """
+    صفحات /article/ تستخدم inline styles للعناوين بدل CSS classes.
+    نحوّل:
+      <strong style="color:#0000FF">نص</strong>  →  <h4>نص</h4>
+      <strong style="color:#cc0000">نص</strong>  →  <h3>نص</h3>  (عنوان رئيسي)
+      dir="RTL" / style="margin-right:..." على <p>  →  تُحذف (نظافة)
+    """
+    BLUE_RE = re.compile(r"color\s*:\s*#0{0,2}0{0,2}[Ff]{2}", re.I)
+    RED_RE  = re.compile(r"color\s*:\s*#[Cc][Cc]0{4}", re.I)
+
+    for strong in body.find_all("strong"):
+        style = strong.get("style", "")
+        txt   = strong.get_text(strip=True)
+        if not txt:
+            continue
+        if BLUE_RE.search(style):
+            strong.replace_with(BeautifulSoup(f"<h4>{txt}</h4>", "html.parser"))
+        elif RED_RE.search(style):
+            strong.replace_with(BeautifulSoup(f"<h3>{txt}</h3>", "html.parser"))
+
+    # تنظيف inline dir / style على الفقرات
+    for p in body.find_all("p"):
+        p.attrs = {}  # احذف كل الـ attributes — نعتمد على CSS الكتاب
+
+
 def scrape_special_page(url: str, pid: str, title: str, level: int) -> Page | None:
     """جلب صفحة خاصة (مقدمة أو مراجع) وتحويلها إلى Page."""
     print(f"  special [{pid}]: {url}")
@@ -262,40 +288,99 @@ def scrape_special_page(url: str, pid: str, title: str, level: int) -> Page | No
     if not soup:
         return None
 
-    # محاولة استخراج العنوان الفعلي من الصفحة
     real_title = page_title(soup)
     if real_title and real_title != "بدون عنوان":
         title = real_title
 
-    # للمراجع: المحتوى في حاوية مختلفة — نحاول عدة مسارات
     body_html, footnotes = "", []
     if "/refs/" in url:
         body_html = _extract_refs_content(soup)
     else:
-        body_html, footnotes = extract_content(soup, pid)
+        body_html, footnotes = _extract_article_content(soup, pid)
 
     bc = [BOOK_TITLE, title]
     return Page(pid=pid, url=url, title=title, level=level,
                 breadcrumb=bc, body_html=body_html, footnotes=footnotes)
 
 
-def _extract_refs_content(soup: BeautifulSoup) -> str:
-    """استخراج محتوى صفحة المراجع — بنية مختلفة عن صفحات الموسوعة."""
-    # الحاوية الرئيسية
-    for selector in ["div#cntnt", "div.container", "main", "article"]:
-        tag, *cls = selector.lstrip("#.").split(".")
-        el = soup.find(selector.split("#")[0].split(".")[0],
-                       id=selector.split("#")[1] if "#" in selector else None,
-                       class_=cls[0] if cls else None)
-        if el:
-            # احذف النصوص التنقلية
-            for rm in el.find_all(["nav", "header", "footer", "script", "style"]):
-                rm.decompose()
-            return el.decode_contents()
+def _extract_article_content(soup: BeautifulSoup, pid: str) -> tuple[str, list]:
+    """
+    صفحات /article/ — المحتوى مباشرة في div#cntnt بدون div.w-100.mt-4.
+    نعالج العناوين ذات inline styles.
+    """
+    cntnt = soup.find("div", id="cntnt")
+    if not cntnt:
+        return "", []
 
-    # fallback: كل body
-    body = soup.find("body")
-    return body.decode_contents() if body else ""
+    body = BeautifulSoup(str(cntnt), "html.parser")
+
+    # احذف عناصر التنقل والزوائد
+    for tag in body.find_all(["nav", "header", "footer", "script", "style", "form"]):
+        tag.decompose()
+    for a in body.find_all("a"):
+        if NAV_TEXT_RE.search(a.get_text()):
+            a.decompose()
+
+    # حوّل العناوين ذات inline styles
+    _normalize_article_html(body)
+
+    # استخرج الهوامش (tips) إن وُجدت
+    footnotes: list[tuple[str, str]] = []
+    fn_n = 0
+    for span in body.find_all("span", class_="tip"):
+        fn_text = span.get_text(strip=True)
+        fn_n += 1
+        fn_id = f"fn-{pid}-{fn_n}"
+        footnotes.append((fn_id, fn_text))
+        anchor = BeautifulSoup(
+            f'<sup id="ref-{fn_id}"><a href="#{fn_id}">[{fn_n}]</a></sup>',
+            "html.parser",
+        )
+        span.replace_with(anchor)
+
+    return body.decode_contents(), footnotes
+
+
+def _extract_refs_content(soup: BeautifulSoup) -> str:
+    """
+    استخراج محتوى صفحة المراجع.
+    البنية: div#cntnt > div.w-100.mt-4 > article × N
+    كل article: h5 (عنوان الكتاب) + div.d-block (مؤلف، ناشر، طبعة...)
+    """
+    cntnt = soup.find("div", id="cntnt")
+    if not cntnt:
+        return ""
+
+    body = cntnt.find("div", class_=lambda c: c and "w-100" in c and "mt-4" in c)
+    if not body:
+        body = cntnt
+
+    body = BeautifulSoup(str(body), "html.parser")
+
+    # احذف الأزرار الجانبية (مشاركة / طباعة / تنبيه)
+    for ul in body.find_all("ul", class_="dorar_v_menu"):
+        ul.decompose()
+    for tag in body.find_all(["script", "style", "nav"]):
+        tag.decompose()
+
+    # حوّل كل article إلى بنية نظيفة
+    out_parts = []
+    for article in body.find_all("article"):
+        h5 = article.find("h5")
+        title = h5.get_text(strip=True) if h5 else ""
+        details = []
+        for div in article.find_all("div", class_="d-block"):
+            pairs = []
+            for strong in div.find_all("strong"):
+                label = strong.get_text(separator=" ", strip=True)
+                pairs.append(label)
+            if pairs:
+                details.append(" | ".join(pairs))
+        details_str = " | ".join(details)
+        block = f"<p><strong>{title}</strong> {details_str}</p>"
+        out_parts.append(block)
+
+    return "\n\n".join(out_parts) if out_parts else body.decode_contents()
 
 
 # ── Scrape All ────────────────────────────────────────────────────────────────
